@@ -35,6 +35,10 @@
     :initarg :package
     :accessor package
     :initform (gensym "DUMPER"))
+   (lisp-implementation
+    :initarg :lisp-implementation
+    :accessor lisp-implementation
+    :initform :sbcl)
    (actions
     :initarg :actions
     :accessor actions
@@ -122,6 +126,14 @@
                                binary-name)
                       '(sb-ext:exit :code 1))))))))))
 
+;ccl doesn't support psuedosymbols yet
+(defgeneric entry-function-form-ccl (dumper) 
+  (:method (dumper)
+    `(lambda ()
+       (with-simple-restart (abort "Exit application")
+	 (,(entry dumper)
+	   ccl:*command-line-argument-list*)))))
+
 (defgeneric entry-function-form (dumper)
   (:method (dumper)
     (cond ((entry dumper)
@@ -153,6 +165,11 @@
   `(progn
      (setf (gethash ',name *dumpable-forms*) ',(first body))
      ,@body))
+
+(defmacro dumpable-noeval (name &body body)
+  (assert (not (cdr body)))
+  `(progn
+     (setf (gethash ',name *dumpable-forms*) ',(first body))))
 
 (defun dump-form (name)
   (gethash name *dumpable-forms*))

@@ -30,6 +30,14 @@
 
 (in-package #:buildapp)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (not (find-package :ccl))
+    (make-package :ccl))
+  (export (intern "SAVE-APPLICATION" :ccl) :ccl)
+  (export (intern "*COMMAND-LINE-ARGUMENT-LIST*" :ccl) :ccl)
+  (export (intern "QUIT" :ccl) :ccl)
+  )
+
 (defparameter *output-type-pathname*
   (let* ((runtime-symbol (find-symbol "*RUNTIME-PATHNAME*" '#:sb-ext))
          (template (if runtime-symbol
@@ -146,6 +154,14 @@ For the latest documentation, see http://www.xach.com/lisp/buildapp/
     (print (sb-debug:backtrace-as-list) *logfile-output*)
     (sb-ext:exit :code 111)))
 
+(dumpable-noeval debugger-ccl
+  (defun dump-file-debugger (condition previous-hook)
+    "The function to call if there are errors when loading the dump file."
+    (declare (ignore previous-hook))
+    (format *system-load-output* "~&Fatal ~A:~%  ~A~%"
+            (type-of condition) condition)
+    (ccl:quit 111)))
+
 (defun command-line-debugger (condition previous-hook)
   "The function to call if there are errors in the command-line
 buildapp application."
@@ -158,6 +174,84 @@ buildapp application."
       (write-string *short-usage* *error-output*)))
   (print (sb-debug:backtrace-as-list) *logfile-output*)
   (sb-ext:exit :code 1))
+
+(dumpable-noeval asdf-ops-ccl
+  (progn
+    (defparameter *load-system* nil)
+    (defparameter *traversal-parent* nil)
+    (defparameter *traversal-parents* nil)
+
+    (defmethod asdf::traverse :around ((operation asdf:load-op)
+                                       (system asdf:system))
+      "Gather some relationship information about systems."
+      (if *load-system*
+          (progn
+            (when *traversal-parent*
+              (push *traversal-parent* (gethash system *traversal-parents* nil)))
+            (let ((*traversal-parent* system))
+              (call-next-method)))
+          (call-next-method)))
+
+    (defmethod asdf:perform :around ((operation asdf:load-op)
+                                     (system asdf:system))
+      "Display terse information about loading systems."
+      (if *load-system*
+          (let ((parents (gethash system *traversal-parents*)))
+            (format *system-load-output*
+                    ";; loading system ~A ~@[(needed by ~{~A~^, ~})~]~%;;  from ~A~%"
+                    (asdf:component-name system)
+                    (mapcar #'asdf:component-name parents)
+                    (asdf:component-pathname system))
+            (force-output *system-load-output*)
+            (call-next-method))
+          (call-next-method)))
+
+    
+
+    (defun remove-dumper-methods ()
+      "Remove any methods added to ASDF GFs as part of the dump process."
+      (flet ((zap-method (gf argtypes)
+               (let ((method (find-method gf '(:around)
+                                          (mapcar #'find-class argtypes))))
+                 (when method
+                   (remove-method gf method)))))
+	
+	(ignore-errors ;CCL fails to find this method
+	  (zap-method #'asdf:perform '(asdf:load-op asdf:cl-source-file)))
+        (zap-method #'asdf:perform '(asdf:load-op asdf:system))
+        (zap-method #'asdf::traverse '(asdf:load-op asdf:system))))
+
+
+    (defun system-search-table (&rest pathnames)
+      (let ((table (make-hash-table :test 'equalp)))
+        (dolist (pathname pathnames table)
+          (setf (gethash (pathname-name pathname) table)
+                (probe-file pathname)))))
+
+    (defvar *asdf-systems-table*)
+
+    (defun system-search-function (name)
+      (gethash name *asdf-systems-table*))
+
+    (defun load-system (name)
+      "Load ASDF system identified by NAME."
+      (let ((*standard-output* *logfile-output*)
+            (*error-output* *logfile-output*)
+            (*compile-verbose* t)
+            (*compile-print* t)
+            (*load-system* t)
+            (*traversal-parents* (make-hash-table)))
+        (handler-bind
+            ((warning
+              (lambda (condition)
+                (when *compile-file-truename*
+                  (unless (typep condition 'style-warning)
+                    (error "Compilation failed: ~A in ~A"
+                           condition
+                           *compile-file-truename*))))))
+          (asdf:oos 'asdf:load-op name)
+          t)))
+    ))
 
 (dumpable asdf-ops
   (progn
@@ -282,6 +376,15 @@ it. If an exact filename is not found, file.lisp is also tried."
           (:require
            `(require ',(make-symbol (string-upcase object)))))))
 
+(defun invoke-debugger-hook-wrapper-ccl (form)
+  `(let ((previous-hook *debugger-hook*)
+         (*debugger-hook*
+          *debugger-hook*))
+     (progn ,form)
+     (unless (eql *debugger-hook* previous-hook)
+       (setf *post-invoke-debugger-hook*
+             *debugger-hook*))))
+
 (defun invoke-debugger-hook-wrapper (form)
   `(let ((previous-hook sb-ext:*invoke-debugger-hook*)
          (sb-ext:*invoke-debugger-hook*
@@ -291,12 +394,17 @@ it. If an exact filename is not found, file.lisp is also tried."
        (setf *post-invoke-debugger-hook*
              sb-ext:*invoke-debugger-hook*))))
 
+(defun dumper-action-form-ccl (dumper)
+  (let ((forms (mapcar 'invoke-debugger-hook-wrapper-ccl
+                       (dumper-action-forms dumper))))
+    `(progn ,@forms)))
+
 (defun dumper-action-form (dumper)
   (let ((forms (mapcar 'invoke-debugger-hook-wrapper
                        (dumper-action-forms dumper))))
     `(progn ,@forms)))
 
-(defun dumpfile-forms (dumper)
+(defun dumpfile-forms-sbcl (dumper)
   "Return a list of forms to be saved to a dumpfile."
   (let* ((package (package dumper))
          (output (merge-pathnames (output dumper) *output-type-pathname*))
@@ -372,6 +480,92 @@ it. If an exact filename is not found, file.lisp is also tried."
                (list :toplevel
                      entry-function-form))))))
 
+;ccl doesn't support psuedosymbols yet
+(defgeneric entry-function-form-ccl (dumper) 
+  (:method (dumper)
+    `(lambda ()
+       (with-simple-restart (abort "Exit application")
+	 (,(entry dumper)
+	   ccl:*command-line-argument-list*)))))
+
+
+(defun dumpfile-forms-ccl (dumper)
+  "Return a list of forms to be saved to a dumpfile."
+  (let* ((package (package dumper))
+         (output (merge-pathnames (output dumper) *output-type-pathname*))
+         (entry-function-form
+          (entry-function-form-ccl dumper))
+         (asdf (needs-asdf-p dumper)))
+    `((cl:defpackage ,package
+        (:use #:cl))
+      (cl:in-package ,package)
+      (defparameter *post-invoke-debugger-hook* nil)
+      (defparameter *system-load-output* *standard-output*)
+      (defvar *logfile-output*)
+      ,(dump-form 'debugger-ccl)
+      (setf *debugger-hook* 'dump-file-debugger)
+      ,@(if (logfile dumper)
+            `((defparameter *logfile-output*
+                (open ,(logfile dumper) :direction :output
+                      :if-exists :supersede))
+              (setf *system-load-output* (make-broadcast-stream
+                                          *standard-output*
+                                          *logfile-output*)))
+            '((defparameter *logfile-output*
+                (make-broadcast-stream))))
+      ,@(when (compress-core dumper)
+              `((unless (member :sb-core-compression *features*)
+                  (error "This SBCL does not support core compression"))))
+      ;; Check for writability to the output file
+      (with-open-file (stream ,(output dumper)
+                              :direction :output
+                              :if-does-not-exist :create
+                              :if-exists :append)
+        (write-line "buildapp write check" stream))
+      (delete-file ,(output dumper))
+      ,@(when asdf
+              `((require '#:asdf)
+                ,(dump-form 'asdf-ops-ccl)
+                (setf *asdf-systems-table*
+                      (system-search-table ,@(asdf-system-files dumper)))
+                (push 'system-search-function
+                      asdf:*system-definition-search-functions*)))
+      ,(dump-form 'file-ops)
+      ,@(mapcar (lambda (path)
+                  `(push ,(directorize path) *load-search-paths*))
+                (load-paths dumper))
+      ,(dumper-action-form-ccl dumper)
+      ,@(when asdf
+              '((remove-dumper-methods)))
+      ,@(when entry-function-form
+              (list (dump-form 'check-pseudosymbol)
+                    (entry-function-check-form dumper)))
+      (ignore-errors (close *logfile-output*))
+      ;; Remove buildapp artifacts from the system
+      (setf *debugger-hook* *post-invoke-debugger-hook*)
+      ,@(when asdf
+              '((setf asdf:*system-definition-search-functions*
+                 (remove 'system-search-function
+                  asdf:*system-definition-search-functions*))))
+      (in-package #:cl-user)
+      (delete-package ',package)
+      (gc)
+      (ccl:save-application
+       ,output
+       ,@(unless (core-only dumper)
+                 '(:prepend-kernel t))
+       ;Currently we ignore this should we error?
+       ;,@(when (compress-core dumper)
+               ;'(:compression t))
+       ,@(when entry-function-form
+               (list :toplevel-function
+                     entry-function-form))))))
+
+(defun dumpfile-forms (dumper)
+  (ecase (lisp-implementation dumper)
+    (:sbcl (dumpfile-forms-sbcl dumper))
+    (:ccl (dumpfile-forms-ccl dumper))))
+
 (defun write-dumpfile (dumper stream)
   (let ((*print-case* :downcase))
     (dolist (form (dumpfile-forms dumper))
@@ -384,6 +578,39 @@ it. If an exact filename is not found, file.lisp is also tried."
     (let ((*print-case* :downcase))
       (write-dumpfile dumper stream))))
 
+(defun dumper-run-args-ccl (dumper loadme)
+  (flatten
+   (list
+    (when (dynamic-space-size dumper)
+      (list "--heap-reserve"
+	    (princ-to-string
+	     (dynamic-space-size dumper))))
+    "--no-init"
+    ;"--quiet"
+    ;"--eval"
+    ;"(setf *debugger-hook* (quit 1))"
+    "--load" loadme)))
+
+(defun dumper-run-args-sbcl (dumper loadme)
+  (flatten
+   (list
+    (when (dynamic-space-size dumper)
+      (list "--dynamic-space-size"
+	    (princ-to-string
+	     (dynamic-space-size dumper))))
+    "--noinform"
+    "--disable-debugger"
+    "--no-userinit"
+    "--no-sysinit"
+    "--disable-debugger"
+    "--load" loadme)))
+
+(defun dumper-run-args (dumper file)
+  (ecase (lisp-implementation dumper)
+  (:sbcl
+   (dumper-run-args-sbcl dumper file))
+  (:ccl
+   (dumper-run-args-ccl dumper file))))
 
 (defun main (argv)
   "Create an executable from the command-line arguments provided in
@@ -392,28 +619,21 @@ ARGV. See *USAGE* for details."
     (write-string *usage* *standard-output*)
     (sb-ext:exit))
   (let* ((dumper (command-line-dumper (rest argv)))
-         (*package* (find-package :buildapp))
-         (dynamic-space-size (dynamic-space-size dumper)))
+         (*package* (find-package :buildapp)))
     (with-tempfile (stream ("dumper.lisp" file))
       (write-dumpfile dumper stream)
       (force-output stream)
       (when (dumpfile-copy dumper)
         (copy-file file (dumpfile-copy dumper)))
+      (print (dumper-run-args dumper
+			      (sb-ext:native-namestring
+			       (probe-file file))))
       (let ((process
+	     
              (sb-ext:run-program (sbcl dumper)
-                                 (flatten
-                                  (list
-                                   (when dynamic-space-size
-                                     (list "--dynamic-space-size"
-                                           (princ-to-string
-                                            dynamic-space-size)))
-                                   "--noinform"
-                                   "--disable-debugger"
-                                   "--no-userinit"
-                                   "--no-sysinit"
-                                   "--disable-debugger"
-                                   "--load" (sb-ext:native-namestring
-                                             (probe-file file))))
+				 (dumper-run-args dumper
+						  (sb-ext:native-namestring
+						   (probe-file file)))
                                  :output *standard-output*
                                  :search t)))
         (let ((status (sb-ext:process-exit-code process)))

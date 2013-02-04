@@ -157,6 +157,9 @@
              (push entry (dispatched-entries plan))))
           (:dynamic-space-size
            (setf (dynamic-space-size plan) (parse-integer value)))
+	  (:implementation
+	   (setf (lisp-implementation plan)
+		 (intern (string-upcase value) :keyword)))
           (t
            (error 'unknown-argument :flag argument)))))))
 

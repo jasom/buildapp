@@ -28,6 +28,13 @@
 
 ;;;; package.lisp
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (not (find-package :ccl))
+    (make-package :ccl))
+  (export (intern "SAVE-APPLICATION" :ccl) :ccl)
+  (export (intern "*COMMAND-LINE-ARGUMENT-LIST*" :ccl) :ccl)
+  (export (intern "QUIT" :ccl) :ccl))
+
 (defpackage #:buildapp
   (:use #:cl)
   (:shadow #:package)
